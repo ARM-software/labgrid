@@ -1,8 +1,10 @@
+
 import pytest
 
 import grpc
 import labgrid.remote.generated.labgrid_coordinator_pb2_grpc as labgrid_coordinator_pb2_grpc
 import labgrid.remote.generated.labgrid_coordinator_pb2 as labgrid_coordinator_pb2
+
 
 @pytest.fixture(scope='function')
 def channel_stub():
@@ -36,6 +38,8 @@ def coordinator_place(channel_stub):
     res = channel_stub.AddPlace(place)
     assert res, f"There was an error: {res}"
     return channel_stub
+
+
 
 def test_startup(coordinator):
     pass
