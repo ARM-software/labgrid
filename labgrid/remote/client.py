@@ -1,6 +1,7 @@
 """The remote.client module contains the functionality to connect to a
 coordinator, acquire a place and interact with the connected resources"""
 
+from abc import ABC
 import argparse
 import asyncio
 import contextlib
@@ -66,17 +67,612 @@ class InteractiveCommandError(Error):
 
 
 @attr.s(eq=False)
-class ClientSession:
+class ClientSession(ABC):
     """The ClientSession encapsulates all the actions a Client can invoke on
     the coordinator."""
 
-    address = attr.ib(validator=attr.validators.instance_of(str))
-    loop = attr.ib(validator=attr.validators.instance_of(asyncio.BaseEventLoop))
+    address = attr.ib(default=None, validator=attr.validators.optional(validator=attr.validators.instance_of(str)))
+    loop = attr.ib(default=None, validator=attr.validators.optional(attr.validators.instance_of(asyncio.BaseEventLoop)))
     env = attr.ib(default=None, validator=attr.validators.optional(attr.validators.instance_of(Environment)))
     role = attr.ib(default=None, validator=attr.validators.optional(attr.validators.instance_of(str)))
     prog = attr.ib(default=None, validator=attr.validators.optional(attr.validators.instance_of(str)))
     args = attr.ib(default=None, validator=attr.validators.optional(attr.validators.instance_of(argparse.Namespace)))
     monitor = attr.ib(default=False, validator=attr.validators.instance_of(bool))
+
+    def _get_driver_or_new(self, target, cls, *, name=None, activate=True):
+        """
+        Helper function trying to get an active driver. If no such driver
+        exists, instanciates a new driver.
+        Driver instanciation works only for drivers without special kwargs.
+
+        Arguments:
+        target -- target to operate on
+        cls -- driver-class to retrieve active or instanciate new driver from
+        name -- optional name to use as a filter
+        activate -- activate the driver (default True)
+        """
+        try:
+            return target.get_driver(cls, name=name, activate=activate)
+        except NoDriverFoundError:
+            if isinstance(cls, str):
+                cls = target_factory.class_from_string(cls)
+
+            if name is not None:
+                # set name in binding map for unique bindings
+                try:
+                    [unique_binding_key] = cls.bindings
+                    target.set_binding_map({unique_binding_key: name})
+                except ValueError:
+                    raise NotImplementedError("Multiple bindings not implemented for named resources")
+
+            drv = cls(target, name=name)
+            if activate:
+                target.activate(drv)
+            return drv
+    
+    def power(self):
+        action = self.args.action
+        delay = self.args.delay
+        name = self.args.name
+        target = self._get_target()
+        from ..resource.power import NetworkPowerPort, PDUDaemonPort
+        from ..resource.remote import NetworkUSBPowerPort, NetworkSiSPMPowerPort
+        from ..resource import TasmotaPowerPort, NetworkYKUSHPowerPort
+
+        drv = None
+        try:
+            drv = target.get_driver("PowerProtocol", name=name)
+        except NoDriverFoundError:
+            for resource in target.resources:
+                if name and resource.name != name:
+                    continue
+                if isinstance(resource, NetworkPowerPort):
+                    drv = self._get_driver_or_new(target, "NetworkPowerDriver", name=name)
+                elif isinstance(resource, NetworkUSBPowerPort):
+                    drv = self._get_driver_or_new(target, "USBPowerDriver", name=name)
+                elif isinstance(resource, NetworkSiSPMPowerPort):
+                    drv = self._get_driver_or_new(target, "SiSPMPowerDriver", name=name)
+                elif isinstance(resource, PDUDaemonPort):
+                    drv = self._get_driver_or_new(target, "PDUDaemonDriver", name=name)
+                elif isinstance(resource, TasmotaPowerPort):
+                    drv = self._get_driver_or_new(target, "TasmotaPowerDriver", name=name)
+                elif isinstance(resource, NetworkYKUSHPowerPort):
+                    drv = self._get_driver_or_new(target, "YKUSHPowerDriver", name=name)
+                if drv:
+                    break
+
+        if not drv:
+            raise UserError("target has no compatible resource available")
+        if delay is not None:
+            drv.delay = delay
+        res = getattr(drv, action)()
+        if action == "get":
+            print(f"power{' ' + name if name else ''} for place is {'on' if res else 'off'}")
+
+    def digital_io(self):
+        action = self.args.action
+        name = self.args.name
+        target = self._get_target()
+        from ..resource import ModbusTCPCoil, OneWirePIO, HttpDigitalOutput
+        from ..resource.remote import NetworkDeditecRelais8, NetworkSysfsGPIO, NetworkLXAIOBusPIO, NetworkHIDRelay
+
+        drv = None
+        try:
+            drv = target.get_driver("DigitalOutputProtocol", name=name)
+        except NoDriverFoundError:
+            for resource in target.resources:
+                if isinstance(resource, ModbusTCPCoil):
+                    drv = self._get_driver_or_new(target, "ModbusCoilDriver", name=name)
+                elif isinstance(resource, OneWirePIO):
+                    drv = self._get_driver_or_new(target, "OneWirePIODriver", name=name)
+                elif isinstance(resource, HttpDigitalOutput):
+                    drv = self._get_driver_or_new(target, "HttpDigitalOutputDriver", name=name)
+                elif isinstance(resource, NetworkDeditecRelais8):
+                    drv = self._get_driver_or_new(target, "DeditecRelaisDriver", name=name)
+                elif isinstance(resource, NetworkSysfsGPIO):
+                    drv = self._get_driver_or_new(target, "GpioDigitalOutputDriver", name=name)
+                elif isinstance(resource, NetworkLXAIOBusPIO):
+                    drv = self._get_driver_or_new(target, "LXAIOBusPIODriver", name=name)
+                elif isinstance(resource, NetworkHIDRelay):
+                    drv = self._get_driver_or_new(target, "HIDRelayDriver", name=name)
+                if drv:
+                    break
+
+        if not drv:
+            raise UserError("target has no compatible resource available")
+        if action == "get":
+            print(f"digital IO{' ' + name if name else ''} for place is {'high' if drv.get() else 'low'}")
+        elif action == "high":
+            drv.set(True)
+        elif action == "low":
+            drv.set(False)
+
+    # asyncs not supported in local mode yet
+    async def _console(self, place, target, timeout, *, logfile=None, loop=False, listen_only=False):
+        name = self.args.name
+        from ..resource import NetworkSerialPort
+
+        resource = target.get_resource(NetworkSerialPort, name=name, wait_avail=False)
+
+        # async await resources
+        timeout = Timeout(timeout)
+        while True:
+            target.update_resources()
+            if resource.avail or (not loop and timeout.expired):
+                break
+            await asyncio.sleep(0.1)
+
+        # use zero timeout to prevent blocking sleeps
+        target.await_resources([resource], timeout=0.0)
+
+        if not place.acquired:
+            print("place released")
+            return 255
+
+        host, port = proxymanager.get_host_and_port(resource)
+
+        # check for valid resources
+        assert port is not None, "Port is not set"
+
+        microcom_bin = shutil.which("microcom")
+
+        if microcom_bin is not None:
+            call = [microcom_bin, "-s", str(resource.speed), "-t", f"{host}:{port}"]
+
+            if listen_only:
+                call.append("--listenonly")
+
+            if logfile:
+                call.append(f"--logfile={logfile}")
+        else:
+            call = ["telnet", host, str(port)]
+
+            logging.info("microcom not available, using telnet instead")
+
+            if listen_only:
+                logging.warning("--listenonly option not supported by telnet, ignoring")
+
+            if logfile:
+                logging.warning("--logfile option not supported by telnet, ignoring")
+
+        print(f"connecting to {resource} calling {' '.join(call)}")
+        try:
+            p = await asyncio.create_subprocess_exec(*call)
+        except FileNotFoundError as e:
+            raise ServerError(f"failed to execute remote console command: {e}")
+        while p.returncode is None:
+            try:
+                await asyncio.wait_for(p.wait(), 1.0)
+            except asyncio.TimeoutError:
+                # subprocess is still running
+                pass
+
+            try:
+                self._check_allowed(place)
+            except UserError:
+                p.terminate()
+                try:
+                    await asyncio.wait_for(p.wait(), 1.0)
+                except asyncio.TimeoutError:
+                    # try harder
+                    p.kill()
+                    await asyncio.wait_for(p.wait(), 1.0)
+                raise
+        if p.returncode:
+            print("connection lost", file=sys.stderr)
+        return p.returncode
+
+    async def console(self, place, target):
+        while True:
+            res = await self._console(
+                place, target, 10.0, logfile=self.args.logfile, loop=self.args.loop, listen_only=self.args.listenonly
+            )
+            # place released
+            if res == 255:
+                break
+            if not self.args.loop:
+                if res:
+                    exc = InteractiveCommandError("microcom error")
+                    exc.exitcode = res
+                    raise exc
+                break
+            await asyncio.sleep(1.0)
+
+    console.needs_target = True
+
+    def dfu(self):
+        target = self._get_target()
+        name = self.args.name
+        if self.args.action == "download" and not self.args.filename:
+            raise UserError("not enough arguments for dfu download")
+        drv = self._get_driver_or_new(target, "DFUDriver", activate=False, name=name)
+        drv.dfu.timeout = self.args.wait
+        target.activate(drv)
+
+        if self.args.action == "download":
+            drv.download(self.args.altsetting, os.path.abspath(self.args.filename))
+        if self.args.action == "detach":
+            drv.detach(self.args.altsetting)
+        if self.args.action == "list":
+            drv.list()
+
+    def fastboot(self):
+        args = self.args.fastboot_args
+        target = self._get_target()
+        name = self.args.name
+
+        drv = self._get_driver_or_new(target, "AndroidFastbootDriver", activate=False, name=name)
+        drv.fastboot.timeout = self.args.wait
+        target.activate(drv)
+
+        try:
+            action = args[0]
+            if action == "flash":
+                drv.flash(args[1], os.path.abspath(args[2]))
+            elif action == "boot":
+                args[1:] = map(os.path.abspath, args[1:])
+                drv.boot(args[1])
+            elif action == "oem" and args[1] == "exec":
+                drv.run(" ".join(args[2:]))
+            else:
+                drv(*args)
+        except IndexError:
+            raise UserError("not enough arguments for fastboot action")
+        except subprocess.CalledProcessError as e:
+            raise UserError(str(e))
+
+    def flashscript(self):
+        target = self._get_target()
+        name = self.args.name
+
+        drv = self._get_driver_or_new(target, "FlashScriptDriver", name=name)
+        drv.flash(script=self.args.script, args=self.args.script_args)
+
+    def bootstrap(self):
+        target = self._get_target()
+        name = self.args.name
+        from ..resource.remote import (
+            NetworkMXSUSBLoader,
+            NetworkIMXUSBLoader,
+            NetworkRKUSBLoader,
+            NetworkAlteraUSBBlaster,
+        )
+        from ..driver import OpenOCDDriver
+
+        drv = None
+        try:
+            drv = target.get_driver("BootstrapProtocol", name=name)
+        except NoDriverFoundError:
+            for resource in target.resources:
+                if isinstance(resource, NetworkIMXUSBLoader):
+                    drv = self._get_driver_or_new(target, "IMXUSBDriver", activate=False, name=name)
+                    drv.loader.timeout = self.args.wait
+                elif isinstance(resource, NetworkMXSUSBLoader):
+                    drv = self._get_driver_or_new(target, "MXSUSBDriver", activate=False, name=name)
+                    drv.loader.timeout = self.args.wait
+                elif isinstance(resource, NetworkAlteraUSBBlaster):
+                    args = dict(arg.split("=", 1) for arg in self.args.bootstrap_args)
+                    try:
+                        drv = target.get_driver("OpenOCDDriver", activate=False, name=name)
+                    except NoDriverFoundError:
+                        drv = OpenOCDDriver(target, name=name, **args)
+                    drv.interface.timeout = self.args.wait
+                elif isinstance(resource, NetworkRKUSBLoader):
+                    drv = self._get_driver_or_new(target, "RKUSBDriver", activate=False, name=name)
+                    drv.loader.timeout = self.args.wait
+                if drv:
+                    break
+
+        if not drv:
+            raise UserError("target has no compatible resource available")
+        target.activate(drv)
+        drv.load(self.args.filename)
+
+    def sd_mux(self):
+        action = self.args.action
+        target = self._get_target()
+        name = self.args.name
+        from ..resource.remote import NetworkUSBSDMuxDevice, NetworkUSBSDWireDevice
+
+        drv = None
+        for resource in target.resources:
+            if isinstance(resource, NetworkUSBSDMuxDevice):
+                drv = self._get_driver_or_new(target, "USBSDMuxDriver", name=name)
+            elif isinstance(resource, NetworkUSBSDWireDevice):
+                drv = self._get_driver_or_new(target, "USBSDWireDriver", name=name)
+            if drv:
+                break
+
+        if not drv:
+            raise UserError("target has no compatible resource available")
+        if action == "get":
+            print(drv.get_mode())
+        else:
+            try:
+                drv.set_mode(action)
+            except ExecutionError as e:
+                raise UserError(str(e))
+
+    def usb_mux(self):
+        name = self.args.name
+        links = self.args.links
+        if links == "off":
+            links = []
+        elif links == "host-dut+host-device":
+            links = ["host-dut", "host-device"]
+        else:
+            links = [links]
+        target = self._get_target()
+        from ..resource.remote import NetworkLXAUSBMux
+
+        drv = None
+        for resource in target.resources:
+            if isinstance(resource, NetworkLXAUSBMux):
+                drv = self._get_driver_or_new(target, "LXAUSBMuxDriver", name=name)
+                break
+
+        if not drv:
+            raise UserError("target has no compatible resource available")
+        drv.set_links(links)
+
+    def _get_ip(self, target):
+        try:
+            resource = target.get_resource("EthernetPort")
+        except NoResourceFoundError:
+            resource = target.get_resource("NetworkService")
+            return resource.address
+
+        matches = []
+        for details in resource.extra.get("macs").values():
+            ips = details.get("ips", [])
+            if not ips:
+                continue
+            matches.append((details["timestamp"], ips))
+        matches.sort()
+        newest = matches[-1][1]
+        if len(ips) > 1:
+            print(f"multiple IPs found: {ips}", file=sys.stderr)
+            return None
+        return newest[0]
+
+    def _get_ssh(self):
+        target = self._get_target()
+
+        try:
+            drv = target.get_driver("SSHDriver", name=self.args.name)
+            return drv
+        except NoDriverFoundError:
+            from ..resource import NetworkService
+
+            try:
+                resource = target.get_resource(NetworkService, name=self.args.name)
+            except NoResourceFoundError:
+                ip = self._get_ip(target)
+                if not ip:
+                    return
+                resource = NetworkService(target, address=str(ip), username="root")
+
+            drv = self._get_driver_or_new(target, "SSHDriver", name=resource.name)
+            return drv
+
+    def ssh(self):
+        drv = self._get_ssh()
+
+        res = drv.interact(self.args.leftover)
+        if res:
+            exc = InteractiveCommandError("ssh error")
+            exc.exitcode = res
+            raise exc
+
+    def scp(self):
+        drv = self._get_ssh()
+
+        res = drv.scp(src=self.args.src, dst=self.args.dst)
+        if res:
+            exc = InteractiveCommandError("scp error")
+            exc.exitcode = res
+            raise exc
+
+    def rsync(self):
+        drv = self._get_ssh()
+
+        res = drv.rsync(src=self.args.src, dst=self.args.dst, extra=self.args.leftover)
+        if res:
+            exc = InteractiveCommandError("rsync error")
+            exc.exitcode = res
+            raise exc
+
+    def sshfs(self):
+        drv = self._get_ssh()
+
+        drv.sshfs(path=self.args.path, mountpoint=self.args.mountpoint)
+
+    def forward(self):
+        if not self.args.local and not self.args.remote:
+            print("Nothing to forward", file=sys.stderr)
+            return
+
+        drv = self._get_ssh()
+
+        with contextlib.ExitStack() as stack:
+            for local, remote in self.args.local:
+                localport = stack.enter_context(drv.forward_local_port(remote, localport=local))
+                print(f"Forwarding local port {localport:d} to remote port {remote:d}")
+
+            for local, remote in self.args.remote:
+                stack.enter_context(drv.forward_remote_port(remote, local))
+                print(f"Forwarding remote port {remote:d} to local port {local:d}")
+
+            try:
+                print("Waiting for CTRL+C...")
+                while True:
+                    signal.pause()
+            except KeyboardInterrupt:
+                print("Exiting...")
+
+    def telnet(self):
+        target = self._get_target()
+        ip = self._get_ip(target)
+        if not ip:
+            return
+        args = ["telnet", str(ip)]
+        res = subprocess.call(args)
+        if res:
+            exc = InteractiveCommandError("telnet error")
+            exc.exitcode = res
+            raise exc
+
+    def video(self):
+        quality = self.args.quality
+        controls = self.args.controls
+        target = self._get_target()
+        name = self.args.name
+        from ..resource.httpvideostream import HTTPVideoStream
+        from ..resource.udev import USBVideo
+        from ..resource.remote import NetworkUSBVideo
+
+        drv = None
+        try:
+            drv = target.get_driver("VideoProtocol", name=name)
+        except NoDriverFoundError:
+            for resource in target.resources:
+                if isinstance(resource, (USBVideo, NetworkUSBVideo)):
+                    drv = self._get_driver_or_new(target, "USBVideoDriver", name=name)
+                elif isinstance(resource, HTTPVideoStream):
+                    drv = self._get_driver_or_new(target, "HTTPVideoDriver", name=name)
+                if drv:
+                    break
+        if not drv:
+            raise UserError("target has no compatible resource available")
+
+        if quality == "list":
+            default, variants = drv.get_qualities()
+            for name, caps in variants:
+                mark = "*" if default == name else " "
+                print(f"{mark} {name:<10s} {caps:s}")
+        else:
+            res = drv.stream(quality, controls=controls)
+            if res:
+                exc = InteractiveCommandError("gst-launch-1.0 error")
+                exc.exitcode = res
+                raise exc
+
+    def audio(self):
+        target = self._get_target()
+        name = self.args.name
+        drv = self._get_driver_or_new(target, "USBAudioInputDriver", name=name)
+        res = drv.play()
+        if res:
+            exc = InteractiveCommandError("gst-launch-1.0 error")
+            exc.exitcode = res
+            raise exc
+
+    def _get_tmc(self):
+        target = self._get_target()
+        name = self.args.name
+
+        return self._get_driver_or_new(target, "USBTMCDriver", name=name)
+
+    def tmc_command(self):
+        drv = self._get_tmc()
+        command = " ".join(self.args.command)
+        if not command:
+            raise UserError("no command given")
+        if "?" in command:
+            result = drv.query(command)
+            print(result)
+        else:
+            drv.command(command)
+
+    def tmc_query(self):
+        drv = self._get_tmc()
+        query = " ".join(self.args.query)
+        if not query:
+            raise UserError("no query given")
+        result = drv.query(query)
+        print(result)
+
+    def tmc_screen(self):
+        drv = self._get_tmc()
+        action = self.args.action
+        if action in ["show", "save"]:
+            extension, data = drv.get_screenshot()
+            filename = "tmc-screen_{0:%Y-%m-%d}_{0:%H:%M:%S}.{1}".format(datetime.now(), extension)
+            with open(filename, "wb") as f:
+                f.write(data)
+            print(f"Saved as {filename}")
+            if action == "show":
+                subprocess.call(["xdg-open", filename])
+
+    def tmc_channel(self):
+        drv = self._get_tmc()
+        channel = self.args.channel
+        action = self.args.action
+        if action == "info":
+            data = drv.get_channel_info(channel)
+        elif action == "values":
+            data = drv.get_channel_values(channel)
+        else:
+            raise ValueError(f"unknown action {action}")
+
+        for k, v in sorted(data.items()):
+            print(f"{k:<16s} {str(v):<10s}")
+
+    def write_files(self):
+        target = self._get_target()
+        name = self.args.name
+        drv = self._get_driver_or_new(target, "USBStorageDriver", activate=False, name=name)
+        drv.storage.timeout = self.args.wait
+        target.activate(drv)
+
+        try:
+            if self.args.partition == 0:
+                self.args.partition = None
+
+            if self.args.rename:
+                if len(self.args.SOURCE) != 2:
+                    self.args.parser.error("the following arguments are required: SOURCE DEST")
+
+                drv.write_files(
+                    [self.args.SOURCE[0]], self.args.SOURCE[1], self.args.partition, target_is_directory=False
+                )
+            else:
+                drv.write_files(
+                    self.args.SOURCE, self.args.target_directory, self.args.partition, target_is_directory=True
+                )
+        except subprocess.CalledProcessError as e:
+            raise UserError(f"could not copy files to network usb storage: {e}")
+        except FileNotFoundError as e:
+            raise UserError(e)
+
+    def write_image(self):
+        target = self._get_target()
+        name = self.args.name
+        drv = self._get_driver_or_new(target, "USBStorageDriver", activate=False, name=name)
+        drv.storage.timeout = self.args.wait
+        target.activate(drv)
+
+        try:
+            drv.write_image(
+                self.args.filename,
+                partition=self.args.partition,
+                skip=self.args.skip,
+                seek=self.args.seek,
+                mode=self.args.write_mode,
+            )
+        except subprocess.CalledProcessError as e:
+            raise UserError(f"could not write image to network usb storage: {e}")
+        except FileNotFoundError as e:
+            raise UserError(e)
+
+    def print_version(self):
+        print(labgrid_version())
+
+
+@attr.s(eq=False)
+class RemoteSession(ClientSession):
+    """The ClientSession encapsulates all the actions a Client can invoke on
+    the coordinator."""
 
     def gethostname(self):
         return os.environ.get("LG_HOSTNAME", gethostname())
@@ -787,7 +1383,8 @@ class ClientSession:
         manager.session = self
         manager.loop = self.loop
 
-    def _get_target(self, place):
+    def _get_target(self):
+        place = self.get_acquired_place()
         self._prepare_manager()
         target = None
         if self.env:
@@ -814,606 +1411,6 @@ class ClientSession:
             target = Target(place.name, env=self.env)
             RemotePlace(target, name=place.name)
         return target
-
-    def _get_driver_or_new(self, target, cls, *, name=None, activate=True):
-        """
-        Helper function trying to get an active driver. If no such driver
-        exists, instanciates a new driver.
-        Driver instanciation works only for drivers without special kwargs.
-
-        Arguments:
-        target -- target to operate on
-        cls -- driver-class to retrieve active or instanciate new driver from
-        name -- optional name to use as a filter
-        activate -- activate the driver (default True)
-        """
-        try:
-            return target.get_driver(cls, name=name, activate=activate)
-        except NoDriverFoundError:
-            if isinstance(cls, str):
-                cls = target_factory.class_from_string(cls)
-
-            if name is not None:
-                # set name in binding map for unique bindings
-                try:
-                    [unique_binding_key] = cls.bindings
-                    target.set_binding_map({unique_binding_key: name})
-                except ValueError:
-                    raise NotImplementedError("Multiple bindings not implemented for named resources")
-
-            drv = cls(target, name=name)
-            if activate:
-                target.activate(drv)
-            return drv
-
-    def power(self):
-        place = self.get_acquired_place()
-        action = self.args.action
-        delay = self.args.delay
-        name = self.args.name
-        target = self._get_target(place)
-        from ..resource.power import NetworkPowerPort, PDUDaemonPort
-        from ..resource.remote import NetworkUSBPowerPort, NetworkSiSPMPowerPort
-        from ..resource import TasmotaPowerPort, NetworkYKUSHPowerPort
-
-        drv = None
-        try:
-            drv = target.get_driver("PowerProtocol", name=name)
-        except NoDriverFoundError:
-            for resource in target.resources:
-                if name and resource.name != name:
-                    continue
-                if isinstance(resource, NetworkPowerPort):
-                    drv = self._get_driver_or_new(target, "NetworkPowerDriver", name=name)
-                elif isinstance(resource, NetworkUSBPowerPort):
-                    drv = self._get_driver_or_new(target, "USBPowerDriver", name=name)
-                elif isinstance(resource, NetworkSiSPMPowerPort):
-                    drv = self._get_driver_or_new(target, "SiSPMPowerDriver", name=name)
-                elif isinstance(resource, PDUDaemonPort):
-                    drv = self._get_driver_or_new(target, "PDUDaemonDriver", name=name)
-                elif isinstance(resource, TasmotaPowerPort):
-                    drv = self._get_driver_or_new(target, "TasmotaPowerDriver", name=name)
-                elif isinstance(resource, NetworkYKUSHPowerPort):
-                    drv = self._get_driver_or_new(target, "YKUSHPowerDriver", name=name)
-                if drv:
-                    break
-
-        if not drv:
-            raise UserError("target has no compatible resource available")
-        if delay is not None:
-            drv.delay = delay
-        res = getattr(drv, action)()
-        if action == "get":
-            print(f"power{' ' + name if name else ''} for place {place.name} is {'on' if res else 'off'}")
-
-    def digital_io(self):
-        place = self.get_acquired_place()
-        action = self.args.action
-        name = self.args.name
-        target = self._get_target(place)
-        from ..resource import ModbusTCPCoil, OneWirePIO, HttpDigitalOutput
-        from ..resource.remote import NetworkDeditecRelais8, NetworkSysfsGPIO, NetworkLXAIOBusPIO, NetworkHIDRelay
-
-        drv = None
-        try:
-            drv = target.get_driver("DigitalOutputProtocol", name=name)
-        except NoDriverFoundError:
-            for resource in target.resources:
-                if isinstance(resource, ModbusTCPCoil):
-                    drv = self._get_driver_or_new(target, "ModbusCoilDriver", name=name)
-                elif isinstance(resource, OneWirePIO):
-                    drv = self._get_driver_or_new(target, "OneWirePIODriver", name=name)
-                elif isinstance(resource, HttpDigitalOutput):
-                    drv = self._get_driver_or_new(target, "HttpDigitalOutputDriver", name=name)
-                elif isinstance(resource, NetworkDeditecRelais8):
-                    drv = self._get_driver_or_new(target, "DeditecRelaisDriver", name=name)
-                elif isinstance(resource, NetworkSysfsGPIO):
-                    drv = self._get_driver_or_new(target, "GpioDigitalOutputDriver", name=name)
-                elif isinstance(resource, NetworkLXAIOBusPIO):
-                    drv = self._get_driver_or_new(target, "LXAIOBusPIODriver", name=name)
-                elif isinstance(resource, NetworkHIDRelay):
-                    drv = self._get_driver_or_new(target, "HIDRelayDriver", name=name)
-                if drv:
-                    break
-
-        if not drv:
-            raise UserError("target has no compatible resource available")
-        if action == "get":
-            print(f"digital IO{' ' + name if name else ''} for place {place.name} is {'high' if drv.get() else 'low'}")
-        elif action == "high":
-            drv.set(True)
-        elif action == "low":
-            drv.set(False)
-
-    async def _console(self, place, target, timeout, *, logfile=None, loop=False, listen_only=False):
-        name = self.args.name
-        from ..resource import NetworkSerialPort
-
-        resource = target.get_resource(NetworkSerialPort, name=name, wait_avail=False)
-
-        # async await resources
-        timeout = Timeout(timeout)
-        while True:
-            target.update_resources()
-            if resource.avail or (not loop and timeout.expired):
-                break
-            await asyncio.sleep(0.1)
-
-        # use zero timeout to prevent blocking sleeps
-        target.await_resources([resource], timeout=0.0)
-
-        if not place.acquired:
-            print("place released")
-            return 255
-
-        host, port = proxymanager.get_host_and_port(resource)
-
-        # check for valid resources
-        assert port is not None, "Port is not set"
-
-        microcom_bin = shutil.which("microcom")
-
-        if microcom_bin is not None:
-            call = [microcom_bin, "-s", str(resource.speed), "-t", f"{host}:{port}"]
-
-            if listen_only:
-                call.append("--listenonly")
-
-            if logfile:
-                call.append(f"--logfile={logfile}")
-        else:
-            call = ["telnet", host, str(port)]
-
-            logging.info("microcom not available, using telnet instead")
-
-            if listen_only:
-                logging.warning("--listenonly option not supported by telnet, ignoring")
-
-            if logfile:
-                logging.warning("--logfile option not supported by telnet, ignoring")
-
-        print(f"connecting to {resource} calling {' '.join(call)}")
-        try:
-            p = await asyncio.create_subprocess_exec(*call)
-        except FileNotFoundError as e:
-            raise ServerError(f"failed to execute remote console command: {e}")
-        while p.returncode is None:
-            try:
-                await asyncio.wait_for(p.wait(), 1.0)
-            except asyncio.TimeoutError:
-                # subprocess is still running
-                pass
-
-            try:
-                self._check_allowed(place)
-            except UserError:
-                p.terminate()
-                try:
-                    await asyncio.wait_for(p.wait(), 1.0)
-                except asyncio.TimeoutError:
-                    # try harder
-                    p.kill()
-                    await asyncio.wait_for(p.wait(), 1.0)
-                raise
-        if p.returncode:
-            print("connection lost", file=sys.stderr)
-        return p.returncode
-
-    async def console(self, place, target):
-        while True:
-            res = await self._console(
-                place, target, 10.0, logfile=self.args.logfile, loop=self.args.loop, listen_only=self.args.listenonly
-            )
-            # place released
-            if res == 255:
-                break
-            if not self.args.loop:
-                if res:
-                    exc = InteractiveCommandError("microcom error")
-                    exc.exitcode = res
-                    raise exc
-                break
-            await asyncio.sleep(1.0)
-
-    console.needs_target = True
-
-    def dfu(self):
-        place = self.get_acquired_place()
-        target = self._get_target(place)
-        name = self.args.name
-        if self.args.action == "download" and not self.args.filename:
-            raise UserError("not enough arguments for dfu download")
-        drv = self._get_driver_or_new(target, "DFUDriver", activate=False, name=name)
-        drv.dfu.timeout = self.args.wait
-        target.activate(drv)
-
-        if self.args.action == "download":
-            drv.download(self.args.altsetting, os.path.abspath(self.args.filename))
-        if self.args.action == "detach":
-            drv.detach(self.args.altsetting)
-        if self.args.action == "list":
-            drv.list()
-
-    def fastboot(self):
-        place = self.get_acquired_place()
-        args = self.args.fastboot_args
-        target = self._get_target(place)
-        name = self.args.name
-
-        drv = self._get_driver_or_new(target, "AndroidFastbootDriver", activate=False, name=name)
-        drv.fastboot.timeout = self.args.wait
-        target.activate(drv)
-
-        try:
-            action = args[0]
-            if action == "flash":
-                drv.flash(args[1], os.path.abspath(args[2]))
-            elif action == "boot":
-                args[1:] = map(os.path.abspath, args[1:])
-                drv.boot(args[1])
-            elif action == "oem" and args[1] == "exec":
-                drv.run(" ".join(args[2:]))
-            else:
-                drv(*args)
-        except IndexError:
-            raise UserError("not enough arguments for fastboot action")
-        except subprocess.CalledProcessError as e:
-            raise UserError(str(e))
-
-    def flashscript(self):
-        place = self.get_acquired_place()
-        target = self._get_target(place)
-        name = self.args.name
-
-        drv = self._get_driver_or_new(target, "FlashScriptDriver", name=name)
-        drv.flash(script=self.args.script, args=self.args.script_args)
-
-    def bootstrap(self):
-        place = self.get_acquired_place()
-        target = self._get_target(place)
-        name = self.args.name
-        from ..resource.remote import (
-            NetworkMXSUSBLoader,
-            NetworkIMXUSBLoader,
-            NetworkRKUSBLoader,
-            NetworkAlteraUSBBlaster,
-        )
-        from ..driver import OpenOCDDriver
-
-        drv = None
-        try:
-            drv = target.get_driver("BootstrapProtocol", name=name)
-        except NoDriverFoundError:
-            for resource in target.resources:
-                if isinstance(resource, NetworkIMXUSBLoader):
-                    drv = self._get_driver_or_new(target, "IMXUSBDriver", activate=False, name=name)
-                    drv.loader.timeout = self.args.wait
-                elif isinstance(resource, NetworkMXSUSBLoader):
-                    drv = self._get_driver_or_new(target, "MXSUSBDriver", activate=False, name=name)
-                    drv.loader.timeout = self.args.wait
-                elif isinstance(resource, NetworkAlteraUSBBlaster):
-                    args = dict(arg.split("=", 1) for arg in self.args.bootstrap_args)
-                    try:
-                        drv = target.get_driver("OpenOCDDriver", activate=False, name=name)
-                    except NoDriverFoundError:
-                        drv = OpenOCDDriver(target, name=name, **args)
-                    drv.interface.timeout = self.args.wait
-                elif isinstance(resource, NetworkRKUSBLoader):
-                    drv = self._get_driver_or_new(target, "RKUSBDriver", activate=False, name=name)
-                    drv.loader.timeout = self.args.wait
-                if drv:
-                    break
-
-        if not drv:
-            raise UserError("target has no compatible resource available")
-        target.activate(drv)
-        drv.load(self.args.filename)
-
-    def sd_mux(self):
-        place = self.get_acquired_place()
-        action = self.args.action
-        target = self._get_target(place)
-        name = self.args.name
-        from ..resource.remote import NetworkUSBSDMuxDevice, NetworkUSBSDWireDevice
-
-        drv = None
-        for resource in target.resources:
-            if isinstance(resource, NetworkUSBSDMuxDevice):
-                drv = self._get_driver_or_new(target, "USBSDMuxDriver", name=name)
-            elif isinstance(resource, NetworkUSBSDWireDevice):
-                drv = self._get_driver_or_new(target, "USBSDWireDriver", name=name)
-            if drv:
-                break
-
-        if not drv:
-            raise UserError("target has no compatible resource available")
-        if action == "get":
-            print(drv.get_mode())
-        else:
-            try:
-                drv.set_mode(action)
-            except ExecutionError as e:
-                raise UserError(str(e))
-
-    def usb_mux(self):
-        place = self.get_acquired_place()
-        name = self.args.name
-        links = self.args.links
-        if links == "off":
-            links = []
-        elif links == "host-dut+host-device":
-            links = ["host-dut", "host-device"]
-        else:
-            links = [links]
-        target = self._get_target(place)
-        from ..resource.remote import NetworkLXAUSBMux
-
-        drv = None
-        for resource in target.resources:
-            if isinstance(resource, NetworkLXAUSBMux):
-                drv = self._get_driver_or_new(target, "LXAUSBMuxDriver", name=name)
-                break
-
-        if not drv:
-            raise UserError("target has no compatible resource available")
-        drv.set_links(links)
-
-    def _get_ip(self, place):
-        target = self._get_target(place)
-        try:
-            resource = target.get_resource("EthernetPort")
-        except NoResourceFoundError:
-            resource = target.get_resource("NetworkService")
-            return resource.address
-
-        matches = []
-        for details in resource.extra.get("macs").values():
-            ips = details.get("ips", [])
-            if not ips:
-                continue
-            matches.append((details["timestamp"], ips))
-        matches.sort()
-        newest = matches[-1][1]
-        if len(ips) > 1:
-            print(f"multiple IPs found: {ips}", file=sys.stderr)
-            return None
-        return newest[0]
-
-    def _get_ssh(self):
-        place = self.get_acquired_place()
-        target = self._get_target(place)
-
-        try:
-            drv = target.get_driver("SSHDriver", name=self.args.name)
-            return drv
-        except NoDriverFoundError:
-            from ..resource import NetworkService
-
-            try:
-                resource = target.get_resource(NetworkService, name=self.args.name)
-            except NoResourceFoundError:
-                ip = self._get_ip(place)
-                if not ip:
-                    return
-                resource = NetworkService(target, address=str(ip), username="root")
-
-            drv = self._get_driver_or_new(target, "SSHDriver", name=resource.name)
-            return drv
-
-    def ssh(self):
-        drv = self._get_ssh()
-
-        res = drv.interact(self.args.leftover)
-        if res:
-            exc = InteractiveCommandError("ssh error")
-            exc.exitcode = res
-            raise exc
-
-    def scp(self):
-        drv = self._get_ssh()
-
-        res = drv.scp(src=self.args.src, dst=self.args.dst)
-        if res:
-            exc = InteractiveCommandError("scp error")
-            exc.exitcode = res
-            raise exc
-
-    def rsync(self):
-        drv = self._get_ssh()
-
-        res = drv.rsync(src=self.args.src, dst=self.args.dst, extra=self.args.leftover)
-        if res:
-            exc = InteractiveCommandError("rsync error")
-            exc.exitcode = res
-            raise exc
-
-    def sshfs(self):
-        drv = self._get_ssh()
-
-        drv.sshfs(path=self.args.path, mountpoint=self.args.mountpoint)
-
-    def forward(self):
-        if not self.args.local and not self.args.remote:
-            print("Nothing to forward", file=sys.stderr)
-            return
-
-        drv = self._get_ssh()
-
-        with contextlib.ExitStack() as stack:
-            for local, remote in self.args.local:
-                localport = stack.enter_context(drv.forward_local_port(remote, localport=local))
-                print(f"Forwarding local port {localport:d} to remote port {remote:d}")
-
-            for local, remote in self.args.remote:
-                stack.enter_context(drv.forward_remote_port(remote, local))
-                print(f"Forwarding remote port {remote:d} to local port {local:d}")
-
-            try:
-                print("Waiting for CTRL+C...")
-                while True:
-                    signal.pause()
-            except KeyboardInterrupt:
-                print("Exiting...")
-
-    def telnet(self):
-        place = self.get_acquired_place()
-        ip = self._get_ip(place)
-        if not ip:
-            return
-        args = ["telnet", str(ip)]
-        res = subprocess.call(args)
-        if res:
-            exc = InteractiveCommandError("telnet error")
-            exc.exitcode = res
-            raise exc
-
-    def video(self):
-        place = self.get_acquired_place()
-        quality = self.args.quality
-        controls = self.args.controls
-        target = self._get_target(place)
-        name = self.args.name
-        from ..resource.httpvideostream import HTTPVideoStream
-        from ..resource.udev import USBVideo
-        from ..resource.remote import NetworkUSBVideo
-
-        drv = None
-        try:
-            drv = target.get_driver("VideoProtocol", name=name)
-        except NoDriverFoundError:
-            for resource in target.resources:
-                if isinstance(resource, (USBVideo, NetworkUSBVideo)):
-                    drv = self._get_driver_or_new(target, "USBVideoDriver", name=name)
-                elif isinstance(resource, HTTPVideoStream):
-                    drv = self._get_driver_or_new(target, "HTTPVideoDriver", name=name)
-                if drv:
-                    break
-        if not drv:
-            raise UserError("target has no compatible resource available")
-
-        if quality == "list":
-            default, variants = drv.get_qualities()
-            for name, caps in variants:
-                mark = "*" if default == name else " "
-                print(f"{mark} {name:<10s} {caps:s}")
-        else:
-            res = drv.stream(quality, controls=controls)
-            if res:
-                exc = InteractiveCommandError("gst-launch-1.0 error")
-                exc.exitcode = res
-                raise exc
-
-    def audio(self):
-        place = self.get_acquired_place()
-        target = self._get_target(place)
-        name = self.args.name
-        drv = self._get_driver_or_new(target, "USBAudioInputDriver", name=name)
-        res = drv.play()
-        if res:
-            exc = InteractiveCommandError("gst-launch-1.0 error")
-            exc.exitcode = res
-            raise exc
-
-    def _get_tmc(self):
-        place = self.get_acquired_place()
-        target = self._get_target(place)
-        name = self.args.name
-
-        return self._get_driver_or_new(target, "USBTMCDriver", name=name)
-
-    def tmc_command(self):
-        drv = self._get_tmc()
-        command = " ".join(self.args.command)
-        if not command:
-            raise UserError("no command given")
-        if "?" in command:
-            result = drv.query(command)
-            print(result)
-        else:
-            drv.command(command)
-
-    def tmc_query(self):
-        drv = self._get_tmc()
-        query = " ".join(self.args.query)
-        if not query:
-            raise UserError("no query given")
-        result = drv.query(query)
-        print(result)
-
-    def tmc_screen(self):
-        drv = self._get_tmc()
-        action = self.args.action
-        if action in ["show", "save"]:
-            extension, data = drv.get_screenshot()
-            filename = "tmc-screen_{0:%Y-%m-%d}_{0:%H:%M:%S}.{1}".format(datetime.now(), extension)
-            with open(filename, "wb") as f:
-                f.write(data)
-            print(f"Saved as {filename}")
-            if action == "show":
-                subprocess.call(["xdg-open", filename])
-
-    def tmc_channel(self):
-        drv = self._get_tmc()
-        channel = self.args.channel
-        action = self.args.action
-        if action == "info":
-            data = drv.get_channel_info(channel)
-        elif action == "values":
-            data = drv.get_channel_values(channel)
-        else:
-            raise ValueError(f"unknown action {action}")
-
-        for k, v in sorted(data.items()):
-            print(f"{k:<16s} {str(v):<10s}")
-
-    def write_files(self):
-        place = self.get_acquired_place()
-        target = self._get_target(place)
-        name = self.args.name
-        drv = self._get_driver_or_new(target, "USBStorageDriver", activate=False, name=name)
-        drv.storage.timeout = self.args.wait
-        target.activate(drv)
-
-        try:
-            if self.args.partition == 0:
-                self.args.partition = None
-
-            if self.args.rename:
-                if len(self.args.SOURCE) != 2:
-                    self.args.parser.error("the following arguments are required: SOURCE DEST")
-
-                drv.write_files(
-                    [self.args.SOURCE[0]], self.args.SOURCE[1], self.args.partition, target_is_directory=False
-                )
-            else:
-                drv.write_files(
-                    self.args.SOURCE, self.args.target_directory, self.args.partition, target_is_directory=True
-                )
-        except subprocess.CalledProcessError as e:
-            raise UserError(f"could not copy files to network usb storage: {e}")
-        except FileNotFoundError as e:
-            raise UserError(e)
-
-    def write_image(self):
-        place = self.get_acquired_place()
-        target = self._get_target(place)
-        name = self.args.name
-        drv = self._get_driver_or_new(target, "USBStorageDriver", activate=False, name=name)
-        drv.storage.timeout = self.args.wait
-        target.activate(drv)
-
-        try:
-            drv.write_image(
-                self.args.filename,
-                partition=self.args.partition,
-                skip=self.args.skip,
-                seek=self.args.seek,
-                mode=self.args.write_mode,
-            )
-        except subprocess.CalledProcessError as e:
-            raise UserError(f"could not write image to network usb storage: {e}")
-        except FileNotFoundError as e:
-            raise UserError(e)
 
     async def create_reservation(self):
         prio = self.args.prio
@@ -1592,7 +1589,7 @@ def start_session(
 
     address = proxymanager.get_grpc_address(address, default_port=20408)
 
-    session = ClientSession(address, loop, **extra)
+    session = RemoteSession(address, loop, **extra)
     loop.run_until_complete(session.start())
     return session
 
@@ -1661,33 +1658,8 @@ class ExportFormat(enum.Enum):
         return self.value
 
 
-def main():
-    basicConfig(
-        level=logging.WARNING,
-        stream=sys.stderr,
-    )
-
-    StepLogger.start()
-    processwrapper.enable_logging()
-
-    # Support both legacy variables and properly namespaced ones
-    place = os.environ.get("PLACE", None)
-    place = os.environ.get("LG_PLACE", place)
-    state = os.environ.get("STATE", None)
-    state = os.environ.get("LG_STATE", state)
-    initial_state = os.environ.get("LG_INITIAL_STATE", None)
-    token = os.environ.get("LG_TOKEN", None)
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-x",
-        "--coordinator",
-        metavar="ADDRESS",
-        type=str,
-        help="coordinator HOST[:PORT] (default: value from env variable LG_COORDINATOR, otherwise 127.0.0.1:20408)",
-    )
+def common_args(parser, subparsers, state, initial_state):
     parser.add_argument("-c", "--config", type=str, default=os.environ.get("LG_ENV"), help="config file")
-    parser.add_argument("-p", "--place", type=str, default=place, help="place name/alias")
     parser.add_argument("-s", "--state", type=str, default=state, help="strategy state to switch into before command")
     parser.add_argument(
         "-i",
@@ -1701,110 +1673,7 @@ def main():
     )
     parser.add_argument("-v", "--verbose", action="count", default=0)
     parser.add_argument("-P", "--proxy", type=str, help="proxy connections via given ssh host")
-    subparsers = parser.add_subparsers(
-        dest="command",
-        title="available subcommands",
-        metavar="COMMAND",
-    )
-
-    subparser = subparsers.add_parser("help")
-
-    subparser = subparsers.add_parser("complete")
-    subparser.add_argument("type", choices=["resources", "places", "matches", "match-names"])
-    subparser.set_defaults(func=ClientSession.complete)
-
-    subparser = subparsers.add_parser("monitor", help="monitor events from the coordinator")
-    subparser.add_argument(
-        "--session", default="", dest="monitor_session", help="Create a session to book places and reservations under"
-    )
-    subparser.set_defaults(func=ClientSession.do_monitor)
-
-    subparser = subparsers.add_parser("resources", aliases=("r",), help="list available resources")
-    subparser.add_argument("-a", "--acquired", action="store_true")
-    subparser.add_argument("-e", "--exporter")
-    subparser.add_argument(
-        "--sort-by-matched-place-change",
-        action="store_true",
-        help="sort by matched place's changed date (oldest first) and show place and date",
-    )  # pylint: disable=line-too-long
-    subparser.add_argument("match", nargs="?")
-    subparser.set_defaults(func=ClientSession.print_resources)
-
-    subparser = subparsers.add_parser("places", aliases=("p",), help="list available places")
-    subparser.add_argument("-a", "--acquired", action="store_true")
-    subparser.add_argument("--sort-last-changed", action="store_true", help="sort by last changed date (oldest first)")
-    subparser.set_defaults(func=ClientSession.print_places)
-
-    subparser = subparsers.add_parser("who", help="list acquired places by user")
-    subparser.add_argument(
-        "-e", "--show-exporters", action="store_true", help="show exporters currently used by each place"
-    )
-    subparser.set_defaults(func=ClientSession.print_who)
-
-    subparser = subparsers.add_parser("show", help="show a place and related resources")
-    subparser.set_defaults(func=ClientSession.print_place)
-
-    subparser = subparsers.add_parser("create", help="add a new place")
-    subparser.set_defaults(func=ClientSession.add_place)
-
-    subparser = subparsers.add_parser("delete", help="delete an existing place")
-    subparser.set_defaults(func=ClientSession.del_place)
-
-    subparser = subparsers.add_parser("add-alias", help="add an alias to a place")
-    subparser.add_argument("alias")
-    subparser.set_defaults(func=ClientSession.add_alias)
-
-    subparser = subparsers.add_parser("del-alias", help="delete an alias from a place")
-    subparser.add_argument("alias")
-    subparser.set_defaults(func=ClientSession.del_alias)
-
-    subparser = subparsers.add_parser("set-comment", help="update the place comment")
-    subparser.add_argument("comment", nargs="+")
-    subparser.set_defaults(func=ClientSession.set_comment)
-
-    subparser = subparsers.add_parser("set-tags", help="update the place tags")
-    subparser.add_argument("tags", metavar="KEY=VALUE", nargs="+", help="use an empty value for deletion")
-    subparser.set_defaults(func=ClientSession.set_tags)
-
-    subparser = subparsers.add_parser("add-match", help="add one (or multiple) match pattern(s) to a place")
-    subparser.add_argument("patterns", metavar="PATTERN", nargs="+")
-    subparser.set_defaults(func=ClientSession.add_match)
-
-    subparser = subparsers.add_parser("del-match", help="delete one (or multiple) match pattern(s) from a place")
-    subparser.add_argument("patterns", metavar="PATTERN", nargs="+")
-    subparser.set_defaults(func=ClientSession.del_match)
-
-    subparser = subparsers.add_parser("add-named-match", help="add one match pattern with a name to a place")
-    subparser.add_argument("pattern", metavar="PATTERN")
-    subparser.add_argument("name", metavar="NAME")
-    subparser.set_defaults(func=ClientSession.add_named_match)
-
-    subparser = subparsers.add_parser("acquire", aliases=("lock",), help="acquire a place")
-    subparser.add_argument(
-        "--allow-unmatched", action="store_true", help="allow missing resources for matches when locking the place"
-    )
-    subparser.add_argument("--session", default="", help="Acquire a place within a given session")
-    subparser.set_defaults(func=ClientSession.acquire)
-
-    subparser = subparsers.add_parser("release", aliases=("unlock",), help="release a place")
-    subparser.add_argument(
-        "-k", "--kick", action="store_true", help="release a place even if it is acquired by a different user"
-    )
-    subparser.set_defaults(func=ClientSession.release)
-
-    subparser = subparsers.add_parser(
-        "release-from", help="atomically release a place, but only if locked by a specific user"
-    )
-    subparser.add_argument("acquired", metavar="HOST/USER", help="User and host to match against when releasing")
-    subparser.set_defaults(func=ClientSession.release_from)
-
-    subparser = subparsers.add_parser("allow", help="allow another user to access a place")
-    subparser.add_argument("user", help="<host>/<username>")
-    subparser.set_defaults(func=ClientSession.allow)
-
-    subparser = subparsers.add_parser("env", help="generate a labgrid environment file for a place")
-    subparser.set_defaults(func=ClientSession.print_env)
-
+    
     subparser = subparsers.add_parser("power", aliases=("pw",), help="change (or get) a place's power status")
     subparser.add_argument("action", choices=["on", "off", "cycle", "get"])
     subparser.add_argument(
@@ -1968,6 +1837,7 @@ def main():
         default=1,
         help="partition number to mount or 0 to mount whole disk (default: %(default)s)",
     )
+
     group = subparser.add_mutually_exclusive_group()
     group.add_argument(
         "-t",
@@ -1999,6 +1869,144 @@ def main():
     subparser.add_argument("--name", "-n", help="optional resource name")
     subparser.add_argument("filename", help="filename to boot on the target")
     subparser.set_defaults(func=ClientSession.write_image)
+    
+    subparser = subparsers.add_parser("version", help="show version")
+    subparser.set_defaults(func=ClientSession.print_version)
+
+
+def main():
+    basicConfig(
+        level=logging.WARNING,
+        stream=sys.stderr,
+    )
+
+    StepLogger.start()
+    processwrapper.enable_logging()
+
+    # Support both legacy variables and properly namespaced ones
+    place = os.environ.get("PLACE", None)
+    place = os.environ.get("LG_PLACE", place)
+    state = os.environ.get("STATE", None)
+    state = os.environ.get("LG_STATE", state)
+    initial_state = os.environ.get("LG_INITIAL_STATE", None)
+    token = os.environ.get("LG_TOKEN", None)
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(
+        dest="command",
+        title="available subcommands",
+        metavar="COMMAND",
+    )
+
+    common_args(parser, subparsers, state, initial_state)
+
+    parser.add_argument(
+        "-x",
+        "--coordinator",
+        metavar="ADDRESS",
+        type=str,
+        help="coordinator HOST[:PORT] (default: value from env variable LG_COORDINATOR, otherwise 127.0.0.1:20408)",
+    )
+    parser.add_argument("-p", "--place", type=str, default=place, help="place name/alias")
+    parser.add_argument("-l", "--local", action="store_true", help="Run without connecting to coordinator")
+
+    subparser = subparsers.add_parser("help")
+
+    subparser = subparsers.add_parser("complete")
+    subparser.add_argument("type", choices=["resources", "places", "matches", "match-names"])
+    subparser.set_defaults(func=RemoteSession.complete)
+
+    subparser = subparsers.add_parser("monitor", help="monitor events from the coordinator")
+    subparser.add_argument(
+        "--session", default="", dest="monitor_session", help="Create a session to book places and reservations under"
+    )
+    subparser.set_defaults(func=RemoteSession.do_monitor)
+
+    subparser = subparsers.add_parser("resources", aliases=("r",), help="list available resources")
+    subparser.add_argument("-a", "--acquired", action="store_true")
+    subparser.add_argument("-e", "--exporter")
+    subparser.add_argument(
+        "--sort-by-matched-place-change",
+        action="store_true",
+        help="sort by matched place's changed date (oldest first) and show place and date",
+    )  # pylint: disable=line-too-long
+    subparser.add_argument("match", nargs="?")
+    subparser.set_defaults(func=RemoteSession.print_resources)
+
+    subparser = subparsers.add_parser("places", aliases=("p",), help="list available places")
+    subparser.add_argument("-a", "--acquired", action="store_true")
+    subparser.add_argument("--sort-last-changed", action="store_true", help="sort by last changed date (oldest first)")
+    subparser.set_defaults(func=RemoteSession.print_places)
+
+    subparser = subparsers.add_parser("who", help="list acquired places by user")
+    subparser.add_argument(
+        "-e", "--show-exporters", action="store_true", help="show exporters currently used by each place"
+    )
+    subparser.set_defaults(func=RemoteSession.print_who)
+
+    subparser = subparsers.add_parser("show", help="show a place and related resources")
+    subparser.set_defaults(func=RemoteSession.print_place)
+
+    subparser = subparsers.add_parser("create", help="add a new place")
+    subparser.set_defaults(func=RemoteSession.add_place)
+
+    subparser = subparsers.add_parser("delete", help="delete an existing place")
+    subparser.set_defaults(func=RemoteSession.del_place)
+
+    subparser = subparsers.add_parser("add-alias", help="add an alias to a place")
+    subparser.add_argument("alias")
+    subparser.set_defaults(func=RemoteSession.add_alias)
+
+    subparser = subparsers.add_parser("del-alias", help="delete an alias from a place")
+    subparser.add_argument("alias")
+    subparser.set_defaults(func=RemoteSession.del_alias)
+
+    subparser = subparsers.add_parser("set-comment", help="update the place comment")
+    subparser.add_argument("comment", nargs="+")
+    subparser.set_defaults(func=RemoteSession.set_comment)
+
+    subparser = subparsers.add_parser("set-tags", help="update the place tags")
+    subparser.add_argument("tags", metavar="KEY=VALUE", nargs="+", help="use an empty value for deletion")
+    subparser.set_defaults(func=RemoteSession.set_tags)
+
+    subparser = subparsers.add_parser("add-match", help="add one (or multiple) match pattern(s) to a place")
+    subparser.add_argument("patterns", metavar="PATTERN", nargs="+")
+    subparser.set_defaults(func=RemoteSession.add_match)
+
+    subparser = subparsers.add_parser("del-match", help="delete one (or multiple) match pattern(s) from a place")
+    subparser.add_argument("patterns", metavar="PATTERN", nargs="+")
+    subparser.set_defaults(func=RemoteSession.del_match)
+
+    subparser = subparsers.add_parser("add-named-match", help="add one match pattern with a name to a place")
+    subparser.add_argument("pattern", metavar="PATTERN")
+    subparser.add_argument("name", metavar="NAME")
+    subparser.set_defaults(func=RemoteSession.add_named_match)
+
+    subparser = subparsers.add_parser("acquire", aliases=("lock",), help="acquire a place")
+    subparser.add_argument(
+        "--allow-unmatched", action="store_true", help="allow missing resources for matches when locking the place"
+    )
+    subparser.add_argument("--session", default="", help="Acquire a place within a given session")
+    subparser.set_defaults(func=RemoteSession.acquire)
+
+    subparser = subparsers.add_parser("release", aliases=("unlock",), help="release a place")
+    subparser.add_argument(
+        "-k", "--kick", action="store_true", help="release a place even if it is acquired by a different user"
+    )
+    subparser.set_defaults(func=RemoteSession.release)
+
+    subparser = subparsers.add_parser(
+        "release-from", help="atomically release a place, but only if locked by a specific user"
+    )
+    subparser.add_argument("acquired", metavar="HOST/USER", help="User and host to match against when releasing")
+    subparser.set_defaults(func=RemoteSession.release_from)
+
+    subparser = subparsers.add_parser("allow", help="allow another user to access a place")
+    subparser.add_argument("user", help="<host>/<username>")
+    subparser.set_defaults(func=RemoteSession.allow)
+
+    subparser = subparsers.add_parser("env", help="generate a labgrid environment file for a place")
+    subparser.set_defaults(func=RemoteSession.print_env)
 
     subparser = subparsers.add_parser("reserve", help="create a reservation")
     subparser.add_argument("--wait", action="store_true", help="wait until the reservation is allocated")
@@ -2008,18 +2016,18 @@ def main():
     )
     subparser.add_argument("filters", metavar="KEY=VALUE", nargs="+", help="required tags")
     subparser.add_argument("--session", default="", help="Make a reservation within a given session")
-    subparser.set_defaults(func=ClientSession.create_reservation)
+    subparser.set_defaults(func=RemoteSession.create_reservation)
 
     subparser = subparsers.add_parser("cancel-reservation", help="cancel a reservation")
     subparser.add_argument("token", type=str, default=token, nargs="?" if token else None)
-    subparser.set_defaults(func=ClientSession.cancel_reservation)
+    subparser.set_defaults(func=RemoteSession.cancel_reservation)
 
     subparser = subparsers.add_parser("wait", help="wait for a reservation to be allocated")
     subparser.add_argument("token", type=str, default=token, nargs="?" if token else None)
-    subparser.set_defaults(func=ClientSession.wait_reservation)
+    subparser.set_defaults(func=RemoteSession.wait_reservation)
 
     subparser = subparsers.add_parser("reservations", help="list current reservations")
-    subparser.set_defaults(func=ClientSession.print_reservations)
+    subparser.set_defaults(func=RemoteSession.print_reservations)
 
     subparser = subparsers.add_parser(
         "export", help="export driver information to a file (needs environment with drivers)"
@@ -2033,10 +2041,7 @@ def main():
         help="output format (default: %(default)s)",
     )
     subparser.add_argument("filename", help="output filename")
-    subparser.set_defaults(func=ClientSession.export)
-
-    subparser = subparsers.add_parser("version", help="show version")
-    subparser.set_defaults(func=ClientSession.print_version)
+    subparser.set_defaults(func=RemoteSession.export)
 
     # make any leftover arguments available for some commands
     args, leftover = parser.parse_known_args()

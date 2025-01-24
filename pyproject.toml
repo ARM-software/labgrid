@@ -96,6 +96,7 @@ dev = [
 [project.scripts]
 labgrid-autoinstall = "labgrid.autoinstall.main:main"
 labgrid-client = "labgrid.remote.client:main"
+labgrid-local-client = "labgrid.remote.local_client:main"
 labgrid-exporter = "labgrid.remote.exporter:main"
 labgrid-suggest = "labgrid.resource.suggest:main"
 labgrid-coordinator = "labgrid.remote.coordinator:main"
