@@ -73,7 +73,9 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
     # Command Protocol
 
     def _run(self, cmd, *, timeout=30.0, codec="utf-8", decodeerrors="strict"):
+        print(f"pre-cmd: {cmd}")
         cmd = [*self._base_command, "shell", *shlex.split(cmd)]
+        print(f"pos-cmd: {cmd}")
         result = subprocess.run(
             cmd,
             text=True,  # Automatically decode using default UTF-8
