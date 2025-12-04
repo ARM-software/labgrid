@@ -1,4 +1,3 @@
-import shlex
 import subprocess
 
 import attr
@@ -43,6 +42,7 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
             # adb connection may have gone "stale", resulting in adb blocking
             # indefinitely when making calls to the device. To avoid this,
             # always disconnect first.
+            print(f"calling disconnect with : {self._host}:{str(self._port)}")
             subprocess.run(
                 [self.tool, "disconnect", f"{self._host}:{str(self._port)}"],
                 stderr=subprocess.DEVNULL,
@@ -50,6 +50,7 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
                 timeout=ADB_TIMEOUT,
                 check=False,
             )
+            print(f"calling connect with : {self._host}:{str(self._port)}")
             subprocess.run(
                 [self.tool, "connect", f"{self._host}:{str(self._port)}"],
                 stderr=subprocess.DEVNULL,
@@ -57,11 +58,13 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
                 timeout=ADB_TIMEOUT,
                 check=True,
             )  # Connect adb client to TCP adb device
+
             self._base_command = [self.tool, "-s", f"{self._host}:{str(self._port)}"]
 
     def on_deactivate(self):
         if isinstance(self.device, RemoteADBDevice):
             # Clean up TCP adb device once the driver is deactivated
+            print(f"calling disconnect with : {self._host}:{str(self._port)}")
             subprocess.run(
                 [self.tool, "disconnect", f"{self._host}:{str(self._port)}"],
                 stderr=subprocess.DEVNULL,
@@ -73,7 +76,8 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
     # Command Protocol
 
     def _run(self, cmd, *, timeout=30.0, codec="utf-8", decodeerrors="strict"):
-        cmd = [*self._base_command, "shell", *shlex.split(cmd)]
+        cmd = [*self._base_command, "shell", cmd]
+        print(f"in _run(): {cmd}")
         result = subprocess.run(
             cmd,
             text=True,  # Automatically decode using default UTF-8
@@ -100,6 +104,7 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
     @Driver.check_active
     @step(args=["filename", "remotepath", "timeout"])
     def put(self, filename: str, remotepath: str, timeout: float = ADB_TIMEOUT):
+        print(f'put {[*self._base_command, "push", filename, remotepath]}')
         subprocess.run(
             [*self._base_command, "push", filename, remotepath],
             timeout=timeout,
@@ -111,6 +116,7 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
     @Driver.check_active
     @step(args=["filename", "destination", "timeout"])
     def get(self, filename: str, destination: str, timeout: float = ADB_TIMEOUT):
+        print(f'get {[*self._base_command, "pull", filename, destination]}')
         subprocess.run(
             [*self._base_command, "pull", filename, destination],
             timeout=timeout,
