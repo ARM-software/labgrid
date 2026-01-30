@@ -98,7 +98,7 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
 
     @Driver.check_active
     @step(args=["filename", "remotepath", "timeout"])
-    def put(self, filename: str, remotepath: str, timeout: float = ADB_TIMEOUT):
+    def put(self, filename: str, remotepath: str, timeout: float | None = None):
         subprocess.run(
             [*self._base_command, "push", filename, remotepath],
             timeout=timeout,
@@ -109,7 +109,7 @@ class ADBDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol, Res
 
     @Driver.check_active
     @step(args=["filename", "destination", "timeout"])
-    def get(self, filename: str, destination: str, timeout: float = ADB_TIMEOUT):
+    def get(self, filename: str, destination: str, timeout: float | None = None):
         subprocess.run(
             [*self._base_command, "pull", filename, destination],
             timeout=timeout,
